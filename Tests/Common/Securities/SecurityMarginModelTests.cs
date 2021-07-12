@@ -1,4 +1,4 @@
-﻿/*
+/*
  * QUANTCONNECT.COM - Democratizing Finance, Empowering Individuals.
  * Lean Algorithmic Trading Engine v2.0. Copyright 2014 QuantConnect Corporation.
  *
@@ -267,7 +267,7 @@ namespace QuantConnect.Tests.Common.Securities
             algorithm.Settings.FreePortfolioValue =
                 algorithm.Portfolio.TotalPortfolioValue * algorithm.Settings.FreePortfolioValuePercentage;
 
-            var actual = algorithm.CalculateOrderQuantity(_symbol, - 1m * security.BuyingPowerModel.GetLeverage(security));
+            var actual = algorithm.CalculateOrderQuantity(_symbol, -1m * security.BuyingPowerModel.GetLeverage(security));
             // (10000 * - 2 * 0.9975 setHoldingsBuffer) / 25 * 0.88 conversion rate - 5 USD fee * 0.88 conversion rate ~=906m
             Assert.AreEqual(-906m, actual);
             Assert.IsTrue(HasSufficientBuyingPowerForOrder(actual, security, algorithm));
@@ -426,8 +426,7 @@ namespace QuantConnect.Tests.Common.Securities
             var requiredFreeBuyingPowerPercent = 0.05m;
             var model = security.BuyingPowerModel = new SecurityMarginModel(1, requiredFreeBuyingPowerPercent);
             security.Holdings.SetHoldings(25, 2000);
-            security.SettlementModel.ApplyFunds(
-                algo.Portfolio, security, DateTime.UtcNow.AddDays(-10), Currencies.USD, -2000 * 25);
+            security.SettlementModel.ApplyFunds(algo.Portfolio, security, DateTime.UtcNow.AddDays(-10), Currencies.USD, -2000 * 25);
 
             // Margin remaining 50k + used 50k + initial margin 50k - 5k free buying power percent (5% of 100k)
             Assert.AreEqual(145000, model.GetBuyingPower(algo.Portfolio, security, OrderDirection.Sell));
@@ -450,8 +449,7 @@ namespace QuantConnect.Tests.Common.Securities
             var requiredFreeBuyingPowerPercent = 0.05m;
             var model = security.BuyingPowerModel = new SecurityMarginModel(2, requiredFreeBuyingPowerPercent);
             security.Holdings.SetHoldings(25, 2000);
-            security.SettlementModel.ApplyFunds(
-                algo.Portfolio, security, DateTime.UtcNow.AddDays(-10), Currencies.USD, -2000 * 25);
+            security.SettlementModel.ApplyFunds(algo.Portfolio, security, DateTime.UtcNow.AddDays(-10), Currencies.USD, -2000 * 25);
 
             // Margin remaining 75k + used 25k + initial margin 25k - 5k free buying power percent (5% of 100k)
             Assert.AreEqual(120000, model.GetBuyingPower(algo.Portfolio, security, OrderDirection.Sell));
@@ -474,8 +472,7 @@ namespace QuantConnect.Tests.Common.Securities
             var requiredFreeBuyingPowerPercent = 0.05m;
             var model = security.BuyingPowerModel = new SecurityMarginModel(2, requiredFreeBuyingPowerPercent);
             security.Holdings.SetHoldings(25, -2000);
-            security.SettlementModel.ApplyFunds(
-                algo.Portfolio, security, DateTime.UtcNow.AddDays(-10), Currencies.USD, 2000 * 25);
+            security.SettlementModel.ApplyFunds(algo.Portfolio, security, DateTime.UtcNow.AddDays(-10), Currencies.USD, 2000 * 25);
 
             // Margin remaining 75k + used 25k + initial margin 25k - 5k free buying power percent (5% of 100k)
             Assert.AreEqual(120000, model.GetBuyingPower(algo.Portfolio, security, OrderDirection.Buy));
@@ -677,23 +674,39 @@ namespace QuantConnect.Tests.Common.Securities
         [TestCase(100, -50000, true)]
         public void GetMaximumOrderQuantityForTargetDeltaBuyingPower_WithHoldings(decimal quantity, decimal buyingPowerDelta, bool invertsSide)
         {
+            // TPV = 100k
             var algo = GetAlgorithm();
             var security = InitAndGetSecurity(algo, 0);
+
+            // SPY @ $25 * Quantity Shares = Holdings
+            // Quantity = 100 -> 2500; TPV = 102500
+            // Quantity = -100 -> -2500; TPV = 97500
             security.Holdings.SetHoldings(security.Price, quantity);
 
+            // Used Buying Power = Holdings / Leverage
+            // Target BP = Used BP + buyingPowerDelta
+            // Target Holdings = Target BP / Unit
+            // Max Order For Delta BP = Target Holdings - Current Holdings
+
+            // EX. -100 Quantity, 510 BP Delta.
+            // Used BP = -2500 / 2 = -1250
+            // Target BP = -1250 + 510 = -740
+            // Target Holdings = -740 / 12.5 = -59.2 -> ~-59
+            // Max Order = -59 - (-100)  = 41
             var actual = security.BuyingPowerModel.GetMaximumOrderQuantityForDeltaBuyingPower(
                 new GetMaximumOrderQuantityForDeltaBuyingPowerParameters(algo.Portfolio,
                     security,
                     buyingPowerDelta)).Quantity;
 
-            var expectedFinalQuantity = Math.Abs(buyingPowerDelta * 2 / 25) * Math.Sign(quantity);
-            if (Math.Sign(quantity) != Math.Sign(buyingPowerDelta))
-            {
-                expectedFinalQuantity *= -1;
-            }
-            expectedFinalQuantity -= expectedFinalQuantity % security.SymbolProperties.LotSize;
+            // Calculate expected using logic above
+            var targetBuyingPower = ((quantity * (security.Price / security.Leverage)) + buyingPowerDelta);
+            var targetHoldings = (targetBuyingPower / (security.Price / security.Leverage));
+            targetHoldings -= (targetHoldings % security.SymbolProperties.LotSize);
 
-            Assert.AreEqual(expectedFinalQuantity, actual);
+            var expectedQuantity = targetHoldings - quantity;
+
+
+            Assert.AreEqual(expectedQuantity, actual);
             Assert.IsTrue(HasSufficientBuyingPowerForOrder(actual, security, algo));
 
             if (invertsSide)
