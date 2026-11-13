@@ -16,8 +16,8 @@
 using System;
 using QuantConnect.Securities;
 using QuantConnect.Securities.Cfd;
-using QuantConnect.Securities.Crypto;
 using QuantConnect.Securities.Forex;
+using QuantConnect.Securities.Crypto;
 
 namespace QuantConnect.Util
 {
@@ -29,27 +29,49 @@ namespace QuantConnect.Util
         private static readonly Lazy<SymbolPropertiesDatabase> SymbolPropertiesDatabase =
             new Lazy<SymbolPropertiesDatabase>(Securities.SymbolPropertiesDatabase.FromDataFolder);
 
+        private static readonly int[][] PotentialStableCoins = { [1, 3], [1, 2], [0, 3], [0, 2] };
+
+        /// <summary>
+        /// Tries to decomposes the specified currency pair into a base and quote currency provided as out parameters
+        /// </summary>
+        /// <param name="currencyPair">The input currency pair to be decomposed</param>
+        /// <param name="baseCurrency">The output base currency</param>
+        /// <param name="quoteCurrency">The output quote currency</param>
+        /// <returns>True if was able to decompose the currency pair</returns>
+        public static bool TryDecomposeCurrencyPair(Symbol currencyPair, out string baseCurrency, out string quoteCurrency)
+        {
+            baseCurrency = null;
+            quoteCurrency = null;
+
+            if (!IsValidSecurityType(currencyPair?.SecurityType, throwException: false))
+            {
+                return false;
+            }
+
+            try
+            {
+                DecomposeCurrencyPair(currencyPair, out baseCurrency, out quoteCurrency);
+                return true;
+            }
+            catch
+            {
+                // ignored
+            }
+
+            return false;
+        }
+
         /// <summary>
         /// Decomposes the specified currency pair into a base and quote currency provided as out parameters
         /// </summary>
         /// <param name="currencyPair">The input currency pair to be decomposed</param>
         /// <param name="baseCurrency">The output base currency</param>
         /// <param name="quoteCurrency">The output quote currency</param>
-        public static void DecomposeCurrencyPair(Symbol currencyPair, out string baseCurrency, out string quoteCurrency)
+        /// <param name="defaultQuoteCurrency">Optionally can provide a default quote currency</param>
+        public static void DecomposeCurrencyPair(Symbol currencyPair, out string baseCurrency, out string quoteCurrency, string defaultQuoteCurrency = Currencies.USD)
         {
-            if (currencyPair == null)
-            {
-                throw new ArgumentException("Currency pair must not be null");
-            }
-
+            IsValidSecurityType(currencyPair?.SecurityType, throwException: true);
             var securityType = currencyPair.SecurityType;
-
-            if (securityType != SecurityType.Forex &&
-                securityType != SecurityType.Cfd &&
-                securityType != SecurityType.Crypto)
-            {
-                throw new ArgumentException($"Unsupported security type: {securityType}");
-            }
 
             if (securityType == SecurityType.Forex)
             {
@@ -61,7 +83,7 @@ namespace QuantConnect.Util
                 currencyPair.ID.Market,
                 currencyPair,
                 currencyPair.SecurityType,
-                Currencies.USD);
+                defaultQuoteCurrency);
 
             if (securityType == SecurityType.Cfd)
             {
@@ -71,6 +93,16 @@ namespace QuantConnect.Util
             {
                 Crypto.DecomposeCurrencyPair(currencyPair, symbolProperties, out baseCurrency, out quoteCurrency);
             }
+        }
+
+        /// <summary>
+        /// Checks whether a symbol is decomposable into a base and a quote currency
+        /// </summary>
+        /// <param name="currencyPair">The pair to check for</param>
+        /// <returns>True if the pair can be decomposed into base and quote currencies, false if not</returns>
+        public static bool IsForexDecomposable(string currencyPair)
+        {
+            return !string.IsNullOrEmpty(currencyPair) && currencyPair.Length == 6;
         }
 
         /// <summary>
@@ -90,7 +122,7 @@ namespace QuantConnect.Util
                 return currencyPair.Value.Length == 6;
             }
 
-            if (currencyPair.SecurityType == SecurityType.Cfd || currencyPair.SecurityType == SecurityType.Crypto)
+            if (currencyPair.SecurityType == SecurityType.Cfd || currencyPair.SecurityType == SecurityType.Crypto || currencyPair.SecurityType == SecurityType.CryptoFuture)
             {
                 var symbolProperties = SymbolPropertiesDatabase.Value.GetSymbolProperties(
                     currencyPair.ID.Market,
@@ -172,17 +204,69 @@ namespace QuantConnect.Util
         /// <returns>The <see cref="Match"/> member that represents the relation between the two pairs</returns>
         public static Match ComparePair(this Symbol pairA, string baseCurrencyB, string quoteCurrencyB)
         {
-            if (pairA.Value == baseCurrencyB + quoteCurrencyB)
+            if (!TryDecomposeCurrencyPair(pairA, out var baseCurrencyA, out var quoteCurrencyA))
+            {
+                return Match.NoMatch;
+            }
+
+            // Check for a stablecoin between the currencies
+            var currencies = new string[] { baseCurrencyA, quoteCurrencyA, baseCurrencyB, quoteCurrencyB };
+            var isThereAnyMatch = false;
+
+            // Compute all the potential stablecoins
+            foreach (var pair in PotentialStableCoins)
+            {
+                if (Currencies.IsStableCoinWithoutPair(currencies[pair[0]] + currencies[pair[1]], pairA.ID.Market)
+                    || Currencies.IsStableCoinWithoutPair(currencies[pair[1]] + currencies[pair[0]], pairA.ID.Market))
+                {
+                    // If there's a stablecoin between them, assign to currency in pair A the value
+                    // of the currency in pair B 
+                    currencies[pair[0]] = currencies[pair[1]];
+                    isThereAnyMatch = true;
+                }
+            }
+
+            string pairAValue = isThereAnyMatch ? string.Concat(currencies[0], "||", currencies[1]) : string.Concat(baseCurrencyA, "||", quoteCurrencyA);
+
+            var directPair = string.Concat(baseCurrencyB, "||", quoteCurrencyB);
+            if (pairAValue == directPair)
             {
                 return Match.ExactMatch;
             }
 
-            if (pairA.Value == quoteCurrencyB + baseCurrencyB)
+            var inversePair = string.Concat(quoteCurrencyB, "||", baseCurrencyB);
+            if (pairAValue == inversePair)
             {
                 return Match.InverseMatch;
             }
 
             return Match.NoMatch;
+        }
+
+        public static bool IsValidSecurityType(SecurityType? securityType, bool throwException)
+        {
+            if (securityType == null)
+            {
+                if (throwException)
+                {
+                    throw new ArgumentException("Currency pair must not be null");
+                }
+                return false;
+            }
+
+            if (securityType != SecurityType.Forex &&
+                securityType != SecurityType.Cfd &&
+                securityType != SecurityType.Crypto &&
+                securityType != SecurityType.CryptoFuture)
+            {
+                if (throwException)
+                {
+                    throw new ArgumentException($"Unsupported security type: {securityType}");
+                }
+                return false;
+            }
+
+            return true;
         }
     }
 }

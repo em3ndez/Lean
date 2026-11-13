@@ -429,7 +429,7 @@ namespace QuantConnect.Tests.Common
 
             Assert.AreEqual(canonicalFutureOption.Underlying.ID.Symbol, futureTicker);
             Assert.AreEqual(canonicalFutureOption.ID.Symbol, expectedFutureOptionTicker);
-            Assert.IsTrue(canonicalFutureOption.Value.StartsWith("?" + futureTicker));
+            Assert.IsTrue(canonicalFutureOption.Value.StartsWith("?" + expectedFutureOptionTicker));
 
             Assert.AreEqual(nonCanonicalFutureOption.Underlying.ID.Symbol, futureTicker);
             Assert.AreEqual(nonCanonicalFutureOption.ID.Symbol, expectedFutureOptionTicker);
@@ -458,7 +458,7 @@ namespace QuantConnect.Tests.Common
         [TestCase("ES 1S4 | ES XLDTU1KH5XC1", "CL", "?ES21F21")] // Future Option Canonical
         [TestCase("ES XKGCMV4QK9VO | ES XLDTU1KH5XC1", "ES", "ES21F21  201218C00000000")] // Future Option
         [TestCase("SPY 2U | SPY R735QTJ8XC9X", "SPY", "?SPY")] // Option Canonical
-        [TestCase("GOOCV 305RBQ2BZBZT2 | GOOCV VP83T1ZUHROL", "GOOCV", "GOOCV 151224P00750000")] // Option
+        [TestCase("GOOCV 305RBQ2BZBZT2 | GOOCV VP83T1ZUHROL", "GOOCV", "GOOCV 151224P00007500")] // Option
         [TestCase("SPY R735QTJ8XC9X", "SPY", "SPY")] // Equity
         [TestCase("EURGBP 8G", "EURGBP", "EURGBP")] // Forex
         [TestCase("BTCUSD XJ", "BTCUSD", "BTCUSD")] // Crypto
@@ -498,6 +498,55 @@ namespace QuantConnect.Tests.Common
                     var canonical = symbol.Canonical;
                 });
             }
+        }
+
+ 
+        [TestCase("SPY", "SPY", "SPY 2T")]
+        [TestCase("NWSA", "FOXA", "NWSA 2T")]
+        [TestCase("NWSA", "FOXA", "NWSA 2S|NWSA 2T")]
+        [TestCase("QQQQ", "QQQ", "QQQQ 2S|QQQQ 31|QQQQ 2T")]
+        public void SymbolAndUnderlyingSymbolsMapped(string ticker, string mappedTicker, string sid)
+        {
+            var symbol = new Symbol(SecurityIdentifier.Parse(sid), ticker);
+            var symbolChain = symbol;
+
+            do
+            {
+                Assert.AreEqual(symbolChain.Value, ticker);
+                symbolChain = symbolChain.Underlying;
+            }
+            while (symbolChain != null);
+
+            symbol = symbol.UpdateMappedSymbol(mappedTicker);
+            symbolChain = symbol;
+
+            do
+            {
+                Console.WriteLine(symbolChain.ToString() + "; Value: " + symbolChain.Value);
+                if (symbolChain.SecurityType == SecurityType.Base || symbolChain.RequiresMapping())
+                {
+                    Assert.AreEqual(mappedTicker, symbolChain.Value);
+                }
+                else 
+                {
+                    Assert.AreNotEqual(mappedTicker, symbolChain.Value);   
+                }
+                symbolChain = symbolChain.Underlying;
+            }
+            while (symbolChain != null);
+        }
+
+        [Test]
+        public void SymbolReferenceNotMappedOnUpdate()
+        {
+            var symbol = Symbol.Create("NWSA", SecurityType.Equity, Market.USA);
+            var customSymbol = Symbol.CreateBase(typeof(BaseData), symbol, Market.USA);
+
+            var mappedSymbol = customSymbol.UpdateMappedSymbol("FOXA");
+            
+            Assert.AreNotEqual(customSymbol.Value, mappedSymbol.Value);
+            Assert.AreNotEqual(customSymbol.Underlying.Value, mappedSymbol.Underlying.Value);
+            Assert.AreNotEqual(symbol.Value, mappedSymbol.Underlying.Value);
         }
     }
 }

@@ -14,6 +14,7 @@
 */
 
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -25,6 +26,8 @@ using QuantConnect.Data;
 using QuantConnect.Data.Custom.IconicTypes;
 using QuantConnect.Data.Market;
 using QuantConnect.Logging;
+using QuantConnect.Orders;
+using QuantConnect.Orders.Fees;
 using QuantConnect.Securities;
 
 namespace QuantConnect.Tests.Common
@@ -57,7 +60,7 @@ namespace QuantConnect.Tests.Common
         public void SerializeRoundTripIconicDataTypes(Type baseDataType, bool hasUnderlyingSymbol)
         {
             var item = CreateNewInstance(baseDataType, hasUnderlyingSymbol);
-            var serialized = item.ProtobufSerialize();
+            var serialized = item.ProtobufSerialize(new Guid());
             
             using (var stream = new MemoryStream(serialized))
             {
@@ -113,7 +116,7 @@ namespace QuantConnect.Tests.Common
 
             var stopwatch = new Stopwatch();
             stopwatch.Start();
-            var serializedTick = ticks.ProtobufSerialize();
+            var serializedTick = ticks.ProtobufSerialize(new Guid());
             stopwatch.Stop();
 
             Log.Trace($"Took {stopwatch.ElapsedMilliseconds}ms. TickCount : {tickCount}.");
@@ -134,7 +137,7 @@ namespace QuantConnect.Tests.Common
                     Assert.AreEqual(i, result.Quantity);
                     Assert.AreEqual(MarketDataType.Tick, result.DataType);
                     Assert.AreEqual("NASDAQ", result.Exchange);
-                    Assert.IsNull(result.SaleCondition);
+                    Assert.AreEqual("VerySold", result.SaleCondition);
                     Assert.AreEqual(TickType.Quote, result.TickType);
                     Assert.AreEqual(time + TimeSpan.FromMilliseconds(i), result.EndTime);
                     Assert.AreEqual(i, result.Value);
@@ -150,7 +153,7 @@ namespace QuantConnect.Tests.Common
         {
             var openInterest = new OpenInterest(DateTime.UtcNow, Symbols.AAPL, 10);
 
-            var serializedTick = openInterest.ProtobufSerialize();
+            var serializedTick = openInterest.ProtobufSerialize(new Guid());
 
             // verify its correct
             using (var stream = new MemoryStream(serializedTick))
@@ -184,7 +187,7 @@ namespace QuantConnect.Tests.Common
                 BidSize = 100
             };
 
-            var serializedTick = tick.ProtobufSerialize();
+            var serializedTick = tick.ProtobufSerialize(new Guid());
 
             // verify its correct
             using (var stream = new MemoryStream(serializedTick))
@@ -197,7 +200,7 @@ namespace QuantConnect.Tests.Common
                 Assert.AreEqual(tick.Quantity, result.Quantity);
                 Assert.AreEqual(tick.DataType, result.DataType);
                 Assert.AreEqual("NASDAQ", result.Exchange);
-                Assert.IsNull(result.SaleCondition);
+                Assert.AreEqual(tick.SaleCondition, result.SaleCondition);
                 Assert.AreEqual(tick.TickType, result.TickType);
                 Assert.AreEqual(tick.EndTime, result.EndTime);
                 Assert.AreEqual(tick.Value, result.Value);
@@ -223,7 +226,7 @@ namespace QuantConnect.Tests.Common
                 Period = TimeSpan.FromMinutes(1)
             };
 
-            var serializedTradeBar = tradeBar.ProtobufSerialize();
+            var serializedTradeBar = tradeBar.ProtobufSerialize(new Guid());
             using (var stream = new MemoryStream(serializedTradeBar))
             {
                 // verify its correct
@@ -258,7 +261,7 @@ namespace QuantConnect.Tests.Common
                 Period = TimeSpan.FromMinutes(1)
             };
 
-            var serializedQuoteBar = quoteBar.ProtobufSerialize();
+            var serializedQuoteBar = quoteBar.ProtobufSerialize(new Guid());
             using (var stream = new MemoryStream(serializedQuoteBar))
             {
                 // verify its correct
@@ -300,7 +303,7 @@ namespace QuantConnect.Tests.Common
                 Value = 0.5m
             };
 
-            var serializedDividend = dividend.ProtobufSerialize();
+            var serializedDividend = dividend.ProtobufSerialize(new Guid());
             using (var stream = new MemoryStream(serializedDividend))
             {
                 var result = (Dividend)Serializer.Deserialize<IEnumerable<BaseData>>(stream).First();
@@ -319,7 +322,7 @@ namespace QuantConnect.Tests.Common
         {
             var split = new Split(Symbols.AAPL, DateTime.UtcNow, decimal.MaxValue, decimal.MinValue, SplitType.SplitOccurred);
 
-            var serializedSplit = split.ProtobufSerialize();
+            var serializedSplit = split.ProtobufSerialize(new Guid());
             using (var stream = new MemoryStream(serializedSplit))
             {
                 var result = (Split)Serializer.Deserialize<IEnumerable<BaseData>>(stream).First();
@@ -341,7 +344,7 @@ namespace QuantConnect.Tests.Common
             {
                 Symbol.Create("SPY", SecurityType.Equity, Market.USA),
                 Symbol.Create("DE30EUR", SecurityType.Cfd, Market.Oanda),
-                Symbol.Create("BTCUSD", SecurityType.Crypto, Market.GDAX),
+                Symbol.Create("BTCUSD", SecurityType.Crypto, Market.Coinbase),
                 Symbol.Create("BTCUSD", SecurityType.Crypto, Market.Bitfinex),
                 Symbol.Create("EURUSD", SecurityType.Forex, Market.FXCM),
                 Symbol.Create("EURUSD", SecurityType.Forex, Market.Oanda),
@@ -374,9 +377,10 @@ namespace QuantConnect.Tests.Common
                 }
             }
 
+            var guid = new Guid();
             {
                 // warmup
-                var serialized = ticks.ProtobufSerialize();
+                var serialized = ticks.ProtobufSerialize(guid);
                 using (var stream = new MemoryStream(serialized))
                 {
                     // verify its correct
@@ -386,7 +390,7 @@ namespace QuantConnect.Tests.Common
                 var start = DateTime.UtcNow;
                 for (var i = 0; i < 10; i++)
                 {
-                    serialized = ticks.ProtobufSerialize();
+                    serialized = ticks.ProtobufSerialize(guid);
                 }
                 var end = DateTime.UtcNow;
                 Log.Trace($"PROTO BUF TOOK {end - start}");
@@ -424,15 +428,48 @@ namespace QuantConnect.Tests.Common
         {
             foreach (var propertyInfo in expected.GetType().GetProperties())
             {
-                // we skip Symbol which isn't protobuffed
-                if (propertyInfo.CustomAttributes.Any())
+                if (propertyInfo.CustomAttributes.Any(data => data.AttributeType == typeof(ProtoMemberAttribute)))
                 {
-                    Assert.AreEqual(propertyInfo.GetValue(expected), propertyInfo.GetValue(result));
+                    var expectedValue = propertyInfo.GetValue(expected);
+                    var resultValue = propertyInfo.GetValue(result);
+                    if (expectedValue is IList)
+                    {
+                        var expectedValueList = (IList) expectedValue;
+                        var resultValueList = (IList) resultValue;
+                        for (var i = 0; i < expectedValueList.Count; i++)
+                        {
+                            AssertAreEqual(expectedValueList[i], resultValueList[i]);
+                        }
+                    }
+                    else if (expectedValue is IDictionary)
+                    {
+                        var expectedValueDictionary = (IDictionary) expectedValue;
+                        var resultValueDictionary = (IDictionary) resultValue;
+                        foreach (dynamic kvp in expectedValueDictionary)
+                        {
+                            AssertAreEqual(kvp.Key, resultValueDictionary.Contains(kvp.Key));
+                            AssertAreEqual(kvp.Value, resultValueDictionary[kvp.Key]);
+                        }
+                    }
+                    else
+                    {
+                        if (expectedValue is OrderEvent || expectedValue is OrderFee)
+                        {
+                            AssertAreEqual(expectedValue, resultValue);
+                        }
+                        else
+                        {
+                            Assert.AreEqual(expectedValue, resultValue);
+                        }
+                    }
                 }
             }
             foreach (var fieldInfo in expected.GetType().GetFields())
             {
-                Assert.AreEqual(fieldInfo.GetValue(expected), fieldInfo.GetValue(result));
+                if (fieldInfo.CustomAttributes.Any(data => data.AttributeType == typeof(ProtoMemberAttribute)))
+                {
+                    Assert.AreEqual(fieldInfo.GetValue(expected), fieldInfo.GetValue(result));
+                }
             }
         }
     }

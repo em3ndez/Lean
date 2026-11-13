@@ -14,16 +14,20 @@
  *
 */
 
+using System;
 using NUnit.Framework;
 using Python.Runtime;
+using static QLNet.NumericHaganPricer;
 
 namespace QuantConnect.Tests.Python
 {
     [TestFixture]
-    class PandasIndexingTests
+    // TODO: Rename to PandasPythonTests, dedicate class to python tests under ./PandasTests directory
+    public class PandasIndexingTests
     {
         private dynamic _module;
         private dynamic _pandasIndexingTests;
+        private dynamic _pandasDataFrameTests;
 
         [SetUp]
         public void Setup()
@@ -32,15 +36,65 @@ namespace QuantConnect.Tests.Python
             {
                 _module = Py.Import("PandasIndexingTests");
                 _pandasIndexingTests = _module.PandasIndexingTests();
+                _pandasDataFrameTests = _module.PandasDataFrameTests();
             }
         }
 
         [Test]
-        public void TestIndexingDataFrameWithList()
+        public void IndexingDataFrameWithList()
         {
             using (Py.GIL())
             {
                 Assert.DoesNotThrow((() => _pandasIndexingTests.test_indexing_dataframe_with_list()));
+            }
+        }
+
+        [Test]
+        public void ContainsUserMappedTickers()
+        {
+            using (Py.GIL())
+            {
+                PyObject result = _pandasDataFrameTests.test_contains_user_mapped_ticker();
+                var test = result.As<bool>();
+
+                Assert.IsTrue(test);
+            }
+        }
+
+        [TestCase("SPY WhatEver")]
+        [TestCase("Sharpe ratio")]
+        public void ContainsUserDefinedColumnsWithSpaces(string columnName)
+        {
+            using (Py.GIL())
+            {
+                PyObject result = _pandasDataFrameTests.test_contains_user_defined_columns_with_spaces(columnName);
+                var test = result.As<bool>();
+
+                Assert.IsTrue(test);
+            }
+        }
+
+        [Test]
+        public void ExpectedException()
+        {
+            using (Py.GIL())
+            {
+                PyObject result = _pandasDataFrameTests.test_expected_exception();
+                var exception = result.As<string>();
+
+                Assert.IsTrue(exception.Contains("No key found for either mapped or original key.", StringComparison.InvariantCulture), exception);
+            }
+        }
+
+        [Test]
+        public void ColumnEqualsOnlyMatchingString()
+        {
+            using (Py.GIL())
+            {
+                PyObject result = _pandasDataFrameTests.test_column_equals_only_matching_string();
+                var test = result.As<bool>();
+
+                Assert.IsTrue(test);
             }
         }
     }

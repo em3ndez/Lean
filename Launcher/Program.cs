@@ -15,13 +15,12 @@
 */
 
 using System;
-using System.ComponentModel.Composition;
-using System.IO;
 using System.Threading;
 using QuantConnect.Configuration;
 using QuantConnect.Lean.Engine;
 using QuantConnect.Logging;
 using QuantConnect.Packets;
+using QuantConnect.Python;
 using QuantConnect.Util;
 
 namespace QuantConnect.Lean.Launcher
@@ -55,10 +54,15 @@ namespace QuantConnect.Lean.Launcher
             // expect first argument to be config file name
             if (args.Length > 0)
             {
-                Config.MergeCommandLineArgumentsWithConfiguration(LeanArgumentParser.ParseArguments(args));
+                var cliArguments = LeanArgumentParser.ParseArguments(args);
+                // Unknown arguments throw, so arguments that parse to no options only requested help or version, already shown
+                if (cliArguments.Count == 0)
+                {
+                    return;
+                }
+                Config.MergeCommandLineArgumentsWithConfiguration(cliArguments);
             }
 
-            var liveMode = Config.GetBool("live-mode");
             //Name thread for the profiler:
             Thread.CurrentThread.Name = "Algorithm Analysis Thread";
 
@@ -66,8 +70,7 @@ namespace QuantConnect.Lean.Launcher
             leanEngineSystemHandlers = Initializer.GetSystemHandlers();
 
             //-> Pull job from QuantConnect job queue, or, pull local build:
-            string assemblyPath;
-            job = leanEngineSystemHandlers.JobQueue.NextJob(out assemblyPath);
+            job = leanEngineSystemHandlers.JobQueue.NextJob(out var assemblyPath);
 
             leanEngineAlgorithmHandlers = Initializer.GetAlgorithmHandlers();
 
@@ -75,8 +78,11 @@ namespace QuantConnect.Lean.Launcher
             {
                 const string jobNullMessage = "Engine.Main(): Sorry we could not process this algorithm request.";
                 Log.Error(jobNullMessage);
-                throw new ArgumentException(jobNullMessage);
+                Exit(1);
             }
+
+            // Activate our PythonVirtualEnvironment
+            PythonInitializer.ActivatePythonVirtualEnvironment(job.PythonVirtualEnvironment);
 
             // if the job version doesn't match this instance version then we can't process it
             // we also don't want to reprocess redelivered jobs
@@ -98,11 +104,13 @@ namespace QuantConnect.Lean.Launcher
                 Console.CancelKeyPress += new ConsoleCancelEventHandler(ExitKeyPress);
 
                 // Create the algorithm manager and start our engine
-                algorithmManager = new AlgorithmManager(liveMode, job);
+                algorithmManager = new AlgorithmManager(Globals.LiveMode, job);
 
                 leanEngineSystemHandlers.LeanManager.Initialize(leanEngineSystemHandlers, leanEngineAlgorithmHandlers, job, algorithmManager);
 
-                var engine = new Engine.Engine(leanEngineSystemHandlers, leanEngineAlgorithmHandlers, liveMode);
+                OS.Initialize();
+
+                var engine = new Engine.Engine(leanEngineSystemHandlers, leanEngineAlgorithmHandlers, Globals.LiveMode);
                 engine.Run(job, algorithmManager, assemblyPath, WorkerThread.Instance);
             }
             finally
@@ -125,17 +133,30 @@ namespace QuantConnect.Lean.Launcher
 
         public static void Exit(int exitCode)
         {
-            //Delete the message from the job queue:
-            leanEngineSystemHandlers.JobQueue.AcknowledgeJob(job);
-            Log.Trace("Engine.Main(): Packet removed from queue: " + job.AlgorithmId);
+            // The job can be null if the algorithm file was not found
+            if (job != null)
+            {
+                //Delete the message from the job queue:
+                leanEngineSystemHandlers.JobQueue.AcknowledgeJob(job);
+                Log.Trace("Engine.Main(): Packet removed from queue: " + job.AlgorithmId);
+            }
 
             // clean up resources
             leanEngineSystemHandlers.DisposeSafely();
             leanEngineAlgorithmHandlers.DisposeSafely();
-            Log.LogHandler.DisposeSafely();
-            OS.CpuPerformanceCounter.DisposeSafely();
+            OS.Dispose();
+            try
+            {
+                var isolator = new Isolator();
+                isolator.ExecuteWithTimeLimit(TimeSpan.FromSeconds(10), PythonInitializer.Shutdown, -1);
+            }
+            catch (Exception ex)
+            {
+                Log.Error(ex, $"Failed to shutdown python");
+            }
 
             Log.Trace("Program.Main(): Exiting Lean...");
+            Log.LogHandler.DisposeSafely();
             Environment.Exit(exitCode);
         }
     }

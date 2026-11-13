@@ -32,16 +32,14 @@ namespace QuantConnect.Lean.Engine.DataFeeds
     /// </summary>
     public class ApiDataProvider : BaseDownloaderDataProvider
     {
-        private readonly int _uid = Config.GetInt("job-user-id", 0);
-        private readonly string _token = Config.Get("api-access-token", "1");
-        private readonly string _organizationId = Config.Get("job-organization-id");
-        private readonly string _dataPath = Config.Get("data-folder", "../../../Data/");
         private decimal _purchaseLimit = Config.GetValue("data-purchase-limit", decimal.MaxValue); //QCC
 
         private readonly HashSet<SecurityType> _unsupportedSecurityType;
         private readonly DataPricesList _dataPrices;
-        private readonly Api.Api _api;
-        private readonly bool _subscribedToEquityMapAndFactorFiles;
+        private readonly IApi _api;
+        private readonly bool _subscribedToIndiaEquityMapAndFactorFiles;
+        private readonly bool _subscribedToUsaEquityMapAndFactorFiles;
+        private readonly bool _subscribedToFutureMapAndFactorFiles;
         private volatile bool _invalidSecurityTypeLog;
 
         /// <summary>
@@ -49,26 +47,39 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         /// </summary>
         public ApiDataProvider()
         {
-            _api = new Api.Api();
             _unsupportedSecurityType = new HashSet<SecurityType> { SecurityType.Future, SecurityType.FutureOption, SecurityType.Index, SecurityType.IndexOption };
-            _api.Initialize(_uid, _token, _dataPath);
+
+            _api = Composer.Instance.GetPart<IApi>();
 
             // If we have no value for organization get account preferred
-            if (string.IsNullOrEmpty(_organizationId))
+            if (string.IsNullOrEmpty(Globals.OrganizationID))
             {
                 var account = _api.ReadAccount();
-                _organizationId = account?.OrganizationId;
-                Log.Trace($"ApiDataProvider(): Will use organization Id '{_organizationId}'.");
+                Globals.OrganizationID = account?.OrganizationId;
+                Log.Trace($"ApiDataProvider(): Will use organization Id '{Globals.OrganizationID}'.");
             }
 
             // Read in data prices and organization details
-            _dataPrices = _api.ReadDataPrices(_organizationId);
-            var organization = _api.ReadOrganization(_organizationId);
+            _dataPrices = _api.ReadDataPrices(Globals.OrganizationID);
+            var organization = _api.ReadOrganization(Globals.OrganizationID);
 
-            // Determine if the user is subscribed to map and factor files (Data product Id 37)
-            if (organization.Products.Where(x => x.Type == ProductType.Data).Any(x => x.Items.Any(x => x.Id == 37)))
+            foreach (var productItem in organization.Products.Where(x => x.Type == ProductType.Data).SelectMany(product => product.Items))
             {
-                _subscribedToEquityMapAndFactorFiles = true;
+                if (productItem.Id == 37)
+                {
+                    // Determine if the user is subscribed to Equity map and factor files (Data product Id 37)
+                    _subscribedToUsaEquityMapAndFactorFiles = true;
+                }
+                else if (productItem.Id == 137)
+                {
+                    // Determine if the user is subscribed to Future map and factor files (Data product Id 137)
+                    _subscribedToFutureMapAndFactorFiles = true;
+                }
+                else if (productItem.Id == 172)
+                {
+                    // Determine if the user is subscribed to India map and factor files (Data product Id 172)
+                    _subscribedToIndiaEquityMapAndFactorFiles = true;
+                }
             }
 
             // Verify user has agreed to data provider agreements
@@ -116,7 +127,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             return DownloadOnce(key, s =>
             {
                 // Verify we have enough credit to handle this
-                var pricePath = _api.FormatPathForDataRequest(key);
+                var pricePath = Api.Api.FormatPathForDataRequest(key);
                 var price = _dataPrices.GetPrice(pricePath);
 
                 // No price found
@@ -145,21 +156,34 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         /// <returns>True if should download</returns>
         protected override bool NeedToDownload(string filePath)
         {
-            // Ignore null and fine fundamental data requests
-            if (filePath == null || filePath.Contains("fine", StringComparison.InvariantCultureIgnoreCase) && filePath.Contains("fundamental", StringComparison.InvariantCultureIgnoreCase))
+            // Ignore null
+            if (filePath == null)
             {
                 return false;
             }
 
             // Some security types can't be downloaded, lets attempt to extract that information
-            if (LeanData.TryParseSecurityType(filePath, out SecurityType securityType) && _unsupportedSecurityType.Contains(securityType))
+            if (LeanData.TryParseSecurityType(filePath, out SecurityType securityType, out var market) &&
+                _unsupportedSecurityType.Contains(securityType) &&
+                // We do support universe data for some security types (options and futures)
+                !IsUniverseData(securityType, filePath))
             {
-                if (!_invalidSecurityTypeLog)
+                // we do support future auxiliary data (map and factor files)
+                if (securityType != SecurityType.Future || !IsAuxiliaryData(filePath))
                 {
-                    // let's log this once. Will still use any existing data on disk
-                    _invalidSecurityTypeLog = true;
-                    Log.Error($"ApiDataProvider(): does not support security types: {string.Join(", ", _unsupportedSecurityType)}");
+                    if (!_invalidSecurityTypeLog)
+                    {
+                        // let's log this once. Will still use any existing data on disk
+                        _invalidSecurityTypeLog = true;
+                        Log.Error($"ApiDataProvider(): does not support security types: {string.Join(", ", _unsupportedSecurityType)}");
+                    }
+                    return false;
                 }
+            }
+
+            if (securityType == SecurityType.Equity && filePath.Contains("fine", StringComparison.InvariantCultureIgnoreCase) && filePath.Contains("fundamental", StringComparison.InvariantCultureIgnoreCase))
+            {
+                // Ignore fine fundamental data requests
                 return false;
             }
 
@@ -167,10 +191,32 @@ namespace QuantConnect.Lean.Engine.DataFeeds
             // Files are only "out of date" for non date based files (hour, daily, margins, etc.) because this data is stored all in one file
             var shouldDownload = !File.Exists(filePath) || filePath.IsOutOfDate();
 
-            // Final check; If we want to download and the request requires equity data we need to be sure they are subscribed to map and factor files
-            if (shouldDownload && (securityType == SecurityType.Equity || securityType == SecurityType.Option || IsEquitiesAux(filePath)))
+            if (shouldDownload)
             {
-                CheckMapFactorFileSubscription();
+                if (securityType == SecurityType.Future)
+                {
+                    if (!_subscribedToFutureMapAndFactorFiles)
+                    {
+                        throw new ArgumentException("ApiDataProvider(): Must be subscribed to map and factor files to use the ApiDataProvider " +
+                            "to download Future auxiliary data from QuantConnect. " +
+                            "Please visit https://www.quantconnect.com/datasets/quantconnect-us-futures-security-master for details.");
+                    }
+                }
+                // Final check; If we want to download and the request requires equity data we need to be sure they are subscribed to map and factor files
+                else if (!_subscribedToUsaEquityMapAndFactorFiles && market.Equals(Market.USA, StringComparison.InvariantCultureIgnoreCase)
+                         && (securityType == SecurityType.Equity || securityType == SecurityType.Option || IsAuxiliaryData(filePath)))
+                {
+                    throw new ArgumentException("ApiDataProvider(): Must be subscribed to map and factor files to use the ApiDataProvider " +
+                        "to download Equity data from QuantConnect. " +
+                        "Please visit https://www.quantconnect.com/datasets/quantconnect-security-master for details.");
+                }
+                else if (!_subscribedToIndiaEquityMapAndFactorFiles && market.Equals(Market.India, StringComparison.InvariantCultureIgnoreCase)
+                         && (securityType == SecurityType.Equity || securityType == SecurityType.Option || IsAuxiliaryData(filePath)))
+                {
+                    throw new ArgumentException("ApiDataProvider(): Must be subscribed to map and factor files to use the ApiDataProvider " +
+                        "to download India data from QuantConnect. " +
+                        "Please visit https://www.quantconnect.com/datasets/truedata-india-equity-security-master for details.");
+                }
             }
 
             return shouldDownload;
@@ -188,7 +234,7 @@ namespace QuantConnect.Lean.Engine.DataFeeds
                 Log.Debug($"ApiDataProvider.Fetch(): Attempting to get data from QuantConnect.com's data library for {filePath}.");
             }
 
-            if (_api.DownloadData(filePath, _organizationId))
+            if (_api.DownloadData(filePath, Globals.OrganizationID))
             {
                 Log.Trace($"ApiDataProvider.Fetch(): Successfully retrieved data for {filePath}.");
                 return true;
@@ -198,11 +244,11 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         }
 
         /// <summary>
-        /// Helper method to determine if this filepath is Equity Aux data
+        /// Helper method to determine if this filepath is auxiliary data
         /// </summary>
-        /// <param name="filepath"></param>
-        /// <returns>True if this file is EquitiesAux</returns>
-        private static bool IsEquitiesAux(string filepath)
+        /// <param name="filepath">The target file path</param>
+        /// <returns>True if this file is of auxiliary data</returns>
+        private static bool IsAuxiliaryData(string filepath)
         {
             return filepath.Contains("map_files", StringComparison.InvariantCulture)
                 || filepath.Contains("factor_files", StringComparison.InvariantCulture)
@@ -211,15 +257,12 @@ namespace QuantConnect.Lean.Engine.DataFeeds
         }
 
         /// <summary>
-        /// Helper to check map and factor file subscription, throws if not subscribed.
+        /// Helper method to determine if this file path if for a universe file
         /// </summary>
-        private void CheckMapFactorFileSubscription()
+        private static bool IsUniverseData(SecurityType securityType, string filepath)
         {
-            if(!_subscribedToEquityMapAndFactorFiles)
-            {
-                throw new ArgumentException("ApiDataProvider(): Must be subscribed to map and factor files to use the ApiDataProvider" +
-                    "to download Equity data from QuantConnect.");
-            }
+            return (securityType.IsOption() || securityType == SecurityType.Future) &&
+                filepath.Contains("universes", StringComparison.InvariantCulture);
         }
     }
 }

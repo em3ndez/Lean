@@ -13,8 +13,10 @@
  * limitations under the License.
 */
 
+using System;
 using System.Linq;
 using QuantConnect.Util;
+using QuantConnect.Orders;
 using System.Collections.Generic;
 using QuantConnect.Securities.Option;
 using QuantConnect.Securities.Option.StrategyMatcher;
@@ -43,9 +45,26 @@ namespace QuantConnect.Securities.Positions
         /// <param name="strategyMatcherOptions">The option strategy matcher options instance to use</param>
         /// <param name="securities">The algorithms securities</param>
         public OptionStrategyPositionGroupResolver(SecurityManager securities, OptionStrategyMatcherOptions strategyMatcherOptions)
+            : this(securities, strategyMatcherOptions, null)
+        {
+        }
+
+        /// <summary>
+        /// Creates the default option strategy group resolver for <see cref="OptionStrategyDefinitions.AllDefinitions"/>,
+        /// which also compares the maintenance margin of candidate matches against the portfolio's securities
+        /// </summary>
+        /// <param name="portfolio">The algorithm's portfolio</param>
+        internal OptionStrategyPositionGroupResolver(SecurityPortfolioManager portfolio)
+            : this(portfolio.Securities, OptionStrategyMatcherOptions.ForDefinitions(OptionStrategyDefinitions.AllDefinitions),
+                new OptionStrategyMatchMarginFunction(portfolio))
+        {
+        }
+
+        private OptionStrategyPositionGroupResolver(SecurityManager securities, OptionStrategyMatcherOptions strategyMatcherOptions,
+            OptionStrategyMatchMarginFunction marginFunction)
         {
             _securities = securities;
-            _strategyMatcher = new OptionStrategyMatcher(strategyMatcherOptions);
+            _strategyMatcher = new OptionStrategyMatcher(strategyMatcherOptions, marginFunction);
         }
 
         /// <summary>
@@ -59,18 +78,55 @@ namespace QuantConnect.Securities.Positions
         /// <returns>True if this resolver can group the specified positions, otherwise false</returns>
         public bool TryGroup(IReadOnlyCollection<IPosition> newPositions, PositionGroupCollection currentPositions, out IPositionGroup @group)
         {
-            var impactedGroups = GetImpactedGroups(currentPositions, newPositions);
-            var positionsToConsiderInNewGroup = impactedGroups.SelectMany(positionGroup => positionGroup.Positions);
-
-            @group = GetPositionGroups(newPositions.Concat(positionsToConsiderInNewGroup)).Where(positionGroup =>
+            IEnumerable<IPosition> positions;
+            if (currentPositions.Count > 0)
             {
-                // from the resolved position groups we will take those which use our buying power model and which are related to the new positions to be executed
-                if (positionGroup.BuyingPowerModel.GetType() == typeof(OptionStrategyPositionGroupBuyingPowerModel))
+                var impactedGroups = GetImpactedGroups(currentPositions, newPositions);
+                var positionsToConsiderInNewGroup = impactedGroups.SelectMany(positionGroup => positionGroup.Positions);
+                positions = newPositions.Concat(positionsToConsiderInNewGroup);
+            }
+            else
+            {
+                if (newPositions.Count == 1)
                 {
-                    return newPositions.Any(position => positionGroup.TryGetPosition(position.Symbol, out position));
+                    // there's no existing position and there's only a single position, no strategy will match
+                    @group = null;
+                    return false;
                 }
-                return false;
-            }).FirstOrDefault();
+                positions = newPositions;
+            }
+
+            @group = GetPositionGroups(positions)
+                .Select(positionGroup =>
+                {
+                    if (positionGroup.Count == 0)
+                    {
+                        return positionGroup;
+                    }
+
+                    if (newPositions.Any(position => positionGroup.TryGetPosition(position.Symbol, out position)))
+                    {
+                        return positionGroup;
+                    }
+
+                    // When none of the new positions are contained in the position group,
+                    // it means that we are liquidating the assets in the new positions
+                    // but some other existing positions were considered as impacted groups.
+                    // Example:
+                    //   Buy(OptionStrategies.BullCallSpread(...), 1);
+                    //   Buy(OptionStrategies.BearPutSpread(...), 1);
+                    //   ...
+                    //   Sell(OptionStrategies.BullCallSpread(...), 1);
+                    //   Sell(OptionStrategies.BearPutSpread(...), 1);
+                    //   -----
+                    //   When attempting revert the bull call position group, the bear put group
+                    //   will be selected as impacted group, so the group will contain the put positions
+                    //   but not the call ones. In this case, we return an valid empty group because the
+                    //   liquidation is happening.
+                    return PositionGroup.Empty(new OptionStrategyPositionGroupBuyingPowerModel(null));
+                })
+                .Where(positionGroup => positionGroup != null)
+                .FirstOrDefault();
 
             return @group != null;
         }
@@ -109,6 +165,12 @@ namespace QuantConnect.Securities.Positions
         /// <returns>An enumerable containing the position groups that could be impacted by the specified position changes</returns>
         public IEnumerable<IPositionGroup> GetImpactedGroups(PositionGroupCollection groups, IReadOnlyCollection<IPosition> positions)
         {
+            if(groups.Count == 0)
+            {
+                // there's no existing groups, nothing to impact
+                return Enumerable.Empty<IPositionGroup>();
+            }
+
             var symbolsSet = positions.Where(position => position.Symbol.SecurityType.HasOptions() || position.Symbol.SecurityType.IsOption())
                 .SelectMany(position =>
                 {
@@ -131,7 +193,8 @@ namespace QuantConnect.Securities.Positions
         {
             foreach (var positionsByUnderlying in positions
                 .Where(position => position.Symbol.SecurityType.HasOptions() || position.Symbol.SecurityType.IsOption())
-                .GroupBy(position => position.Symbol.HasUnderlying? position.Symbol.Underlying : position.Symbol))
+                .GroupBy(position => position.Symbol.HasUnderlying? position.Symbol.Underlying : position.Symbol)
+                .Select(x => x.ToList()))
             {
                 var optionPosition = positionsByUnderlying.FirstOrDefault(position => position.Symbol.SecurityType.IsOption());
                 if (optionPosition == null)
@@ -139,9 +202,16 @@ namespace QuantConnect.Securities.Positions
                     // if there isn't any option position we aren't really interested, can't create any option strategy!
                     continue;
                 }
-                var contractMultiplier = (_securities[optionPosition.Symbol].SymbolProperties as OptionSymbolProperties)?.ContractUnitOfTrade ?? 100;
+                var contractMultiplier = GetContractMultiplier(_securities, optionPosition.Symbol);
 
                 var optionPositionCollection = OptionPositionCollection.FromPositions(positionsByUnderlying, contractMultiplier);
+
+                if (optionPositionCollection.Count == 0 && positionsByUnderlying.Count > 0)
+                {
+                    // we could be liquidating there will be no position left!
+                    yield return PositionGroup.Empty(new OptionStrategyPositionGroupBuyingPowerModel(null));
+                    yield break;
+                }
 
                 var matches = _strategyMatcher.MatchOnce(optionPositionCollection);
                 if (matches.Strategies.Count == 0)
@@ -151,14 +221,43 @@ namespace QuantConnect.Securities.Positions
 
                 foreach (var matchedStrategy in matches.Strategies)
                 {
-                    var positionsToGroup = matchedStrategy.OptionLegs
-                        .Select(optionLeg => (IPosition)new Position(optionLeg.Symbol, optionLeg.Quantity, 1))
-                        .Concat(matchedStrategy.UnderlyingLegs.Select(underlyingLeg => new Position(underlyingLeg.Symbol, underlyingLeg.Quantity * contractMultiplier, 1)))
-                        .ToArray();
-
-                    yield return new PositionGroup(new OptionStrategyPositionGroupBuyingPowerModel(matchedStrategy), positionsToGroup);
+                    yield return CreatePositionGroup(matchedStrategy, contractMultiplier);
                 }
             }
+        }
+
+        /// <summary>
+        /// Gets the quantity of underlying units each contract of the specified option is for
+        /// </summary>
+        internal static int GetContractMultiplier(SecurityManager securities, Symbol option)
+        {
+            return (securities[option].SymbolProperties as OptionSymbolProperties)?.ContractUnitOfTrade ?? 100;
+        }
+
+        /// <summary>
+        /// Creates the position group modeling the buying power of the specified matched option strategy
+        /// </summary>
+        internal static PositionGroup CreatePositionGroup(OptionStrategy matchedStrategy, int contractMultiplier)
+        {
+            var groupQuantity = Math.Abs(matchedStrategy.OptionLegs.Cast<Leg>().Concat(matchedStrategy.UnderlyingLegs)
+                .Select(leg => leg.Quantity)
+                .GreatestCommonDivisor());
+            var positionsToGroup = matchedStrategy.OptionLegs
+                .Select(optionLeg => (IPosition)new Position(optionLeg.Symbol, optionLeg.Quantity,
+                    // The unit quantity of each position is the ratio of the quantity of the leg to the group quantity.
+                    // e.g. a butterfly call strategy three legs: 10:-20:10, the unit quantity of each leg is 1:2:1
+                    Math.Abs(optionLeg.Quantity) / groupQuantity))
+                .Concat(matchedStrategy.UnderlyingLegs.Select(underlyingLeg => new Position(underlyingLeg.Symbol,
+                    underlyingLeg.Quantity * contractMultiplier,
+                    // Same as for the option legs, but we need to multiply by the contract multiplier.
+                    // e.g. a covered call strategy has 100 shares of the underlying, per shorted contract
+                    (Math.Abs(underlyingLeg.Quantity) * contractMultiplier / groupQuantity))))
+                .ToDictionary(position => position.Symbol);
+
+            return new PositionGroup(
+                new PositionGroupKey(new OptionStrategyPositionGroupBuyingPowerModel(matchedStrategy), positionsToGroup.Values),
+                groupQuantity,
+                positionsToGroup);
         }
     }
 }

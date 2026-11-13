@@ -14,9 +14,10 @@
 */
 
 using System;
-using System.IO;
+using QuantConnect.Configuration;
 using QuantConnect.Util;
 using QuantConnect.Logging;
+using System.Globalization;
 using System.Threading.Tasks;
 using QuantConnect.Interfaces;
 using System.Collections.Generic;
@@ -28,7 +29,8 @@ namespace QuantConnect.Data.Auxiliary
     /// </summary>
     public class LocalZipMapFileProvider : IMapFileProvider
     {
-        private Dictionary<string, MapFileResolver> _cache;
+        private readonly DateTime? _lookupDate;
+        private Dictionary<AuxiliaryDataKey, MapFileResolver> _cache;
         private IDataProvider _dataProvider;
         private object _lock;
 
@@ -36,15 +38,33 @@ namespace QuantConnect.Data.Auxiliary
         /// The cached refresh period for the map files
         /// </summary>
         /// <remarks>Exposed for testing</remarks>
-        protected virtual TimeSpan CacheRefreshPeriod => TimeSpan.FromDays(1);
+        protected virtual TimeSpan CacheRefreshPeriod
+        {
+            get
+            {
+                var dueTime = Time.GetNextLiveAuxiliaryDataDueTime();
+                if (dueTime > TimeSpan.FromMinutes(10))
+                {
+                    // Clear the cache before the auxiliary due time to avoid race conditions with consumers
+                    return dueTime - TimeSpan.FromMinutes(10);
+                }
+                return dueTime;
+            }
+        }
 
         /// <summary>
-        /// Creates a new instance of the <see cref="LocalDiskFactorFileProvider"/>
+        /// Creates a new instance of the <see cref="LocalZipMapFileProvider"/>
         /// </summary>
         public LocalZipMapFileProvider()
         {
             _lock = new object();
-            _cache = new Dictionary<string, MapFileResolver>();
+            _cache = new Dictionary<AuxiliaryDataKey, MapFileResolver>();
+            
+            var lookupDateConfig = Config.Get("map-file-provider-lookup-date");
+            if (DateTime.TryParseExact(lookupDateConfig, "yyyyMMdd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var lookupDate))
+            {
+                _lookupDate = lookupDate;
+            }
         }
 
         /// <summary>
@@ -53,6 +73,11 @@ namespace QuantConnect.Data.Auxiliary
         /// <param name="dataProvider">DataProvider to use</param>
         public void Initialize(IDataProvider dataProvider)
         {
+            if (_dataProvider != null)
+            {
+                return;
+            }
+            
             _dataProvider = dataProvider;
             StartExpirationTask();
         }
@@ -60,19 +85,18 @@ namespace QuantConnect.Data.Auxiliary
         /// <summary>
         /// Gets a <see cref="MapFileResolver"/> representing all the map files for the specified market
         /// </summary>
-        /// <param name="market">The equity market, for example, 'usa'</param>
+        /// <param name="auxiliaryDataKey">Key used to fetch a map file resolver. Specifying market and security type</param>
         /// <returns>A <see cref="MapFileResolver"/> containing all map files for the specified market</returns>
-        public MapFileResolver Get(string market)
+        public MapFileResolver Get(AuxiliaryDataKey auxiliaryDataKey)
         {
-            market = market.ToLowerInvariant();
             MapFileResolver result;
             // we use a lock so that only 1 thread loads the map file resolver while the rest wait
             // else we could have multiple threads loading the map file resolver at the same time!
             lock (_lock)
             {
-                if (!_cache.TryGetValue(market, out result))
+                if (!_cache.TryGetValue(auxiliaryDataKey, out result))
                 {
-                    _cache[market] = result = GetMapFileResolver(market);
+                    _cache[auxiliaryDataKey] = result = GetMapFileResolver(auxiliaryDataKey);
                 }
             }
             return result;
@@ -86,50 +110,39 @@ namespace QuantConnect.Data.Auxiliary
             lock (_lock)
             {
                 // we clear the seeded markets so they are reloaded
-                _cache = new Dictionary<string, MapFileResolver>();
+                _cache = new Dictionary<AuxiliaryDataKey, MapFileResolver>();
             }
             _ = Task.Delay(CacheRefreshPeriod).ContinueWith(_ => StartExpirationTask());
         }
 
-        private MapFileResolver GetMapFileResolver(string market)
+        private MapFileResolver GetMapFileResolver(AuxiliaryDataKey auxiliaryDataKey)
         {
-            if (market != QuantConnect.Market.USA.ToLowerInvariant())
-            {
-                // don't explode for other markets which request map files and we don't have
-                return MapFileResolver.Empty;
-            }
+            var market = auxiliaryDataKey.Market;
             var timestamp = DateTime.UtcNow.ConvertFromUtc(TimeZones.NewYork);
             var todayNewYork = timestamp.Date;
-            var yesterdayNewYork = todayNewYork.AddDays(-1);
-
+            // If a lookup date was provided, use it, otherwise use yesterday as the starting point for our search
+            var yesterdayNewYork = _lookupDate ?? todayNewYork.AddDays(-1);
+            // To prevent infinite recursion if something is wrong with the zip files, we look back a maximum of 30 days
+            var endDate = yesterdayNewYork.AddDays(_lookupDate.HasValue ? 0 : -30);
+            
             // start the search with yesterday, today's file will be available tomorrow
-            var count = 0;
-            var date = yesterdayNewYork;
-            do
+            for (var date = yesterdayNewYork; date >= endDate; date = date.AddDays(-1))
             {
-                var zipFileName = Path.Combine(Globals.DataFolder, MapFileZipHelper.GetMapFileZipFileName(market, date));
+                var zipFileName = MapFileZipHelper.GetMapFileZipFileName(market, date, auxiliaryDataKey.SecurityType);
 
                 // Fetch a stream for our zip from our data provider
                 var stream = _dataProvider.Fetch(zipFileName);
 
-                // If we found a file we can read it 
-                if (stream != null)
-                {
-                    Log.Trace("LocalZipMapFileProvider.Get({0}): Fetched map files for: {1} NY", market, date.ToShortDateString());
-                    var result =  new MapFileResolver(MapFileZipHelper.ReadMapFileZip(stream));
-                    stream.DisposeSafely();
-                    return result;
-                }
+                // If we didn't find a file, continue to the next date
+                if (stream == null) continue;
 
-                // prevent infinite recursion if something is wrong
-                if (count++ > 30)
-                {
-                    throw new InvalidOperationException($"LocalZipMapFileProvider couldn't find any map files going all the way back to {date}");
-                }
-
-                date = date.AddDays(-1);
+                Log.Trace($"LocalZipMapFileProvider.Get({market}): Fetched map files for: {date.ToShortDateString()} NY ({(date - todayNewYork).Days} days ago).");
+                var result = new MapFileResolver(MapFileZipHelper.ReadMapFileZip(stream, market, auxiliaryDataKey.SecurityType));
+                stream.DisposeSafely();
+                return result;
             }
-            while (true);
+
+            throw new InvalidOperationException($"LocalZipMapFileProvider couldn't find any map files going all the way back to {endDate.ToShortDateString()} for {market}");
         }
     }
 }

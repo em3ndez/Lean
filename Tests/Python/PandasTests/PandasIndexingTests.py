@@ -11,13 +11,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from clr import AddReference
-AddReference("System")
-AddReference("QuantConnect.Research")
-AddReference("QuantConnect.Common")
-
 from AlgorithmImports import *
+from QuantConnect.Tests import *
+from QuantConnect.Tests.Python import *
+from PandasMapper import PandasColumn
 
+# TODO: Rename to PandasResearchTests and keep this class for QB related tests; rename py module to PandasTests
 class PandasIndexingTests():
     def __init__(self):
         self.qb = QuantBook()
@@ -32,3 +31,46 @@ class PandasIndexingTests():
         test = self.history[[self.symbol]]
         return True
 
+# Test class that sets up two dataframes to test on
+class PandasDataFrameTests():
+    def __init__(self):
+        self.spy = Symbols.SPY
+        self.aapl = Symbols.AAPL
+
+        # Set our symbol cache
+        SymbolCache.Set("SPY", self.spy)
+        SymbolCache.Set("AAPL", self.aapl)
+
+        pdConverter = PandasConverter()
+
+        # Create our dataframes
+        self.spydf = pdConverter.GetDataFrame(PythonTestingUtils.GetSlices(self.spy))
+
+    def test_contains_user_mapped_ticker(self):
+        # Create a new DF that has a plain ticker, test that our mapper doesn't break
+        # searching for it.
+        df = pd.DataFrame({'spy': [2, 5, 8, 10]})
+        return 'spy' in df
+
+    def test_expected_exception(self):
+        # Try indexing a ticker that doesn't exist in this frame, but is still in our cache
+        try:
+            self.spydf['aapl']
+        except KeyError as e:
+            return str(e)
+
+    def test_contains_user_defined_columns_with_spaces(self, column_name):
+        # Adds a column, then try accessing it.
+        # If the colums has white spaces, it should not fail
+        df = self.spydf.copy()
+        df[column_name] = 1
+        try:
+            x = df[column_name]
+            return True
+        except:
+            return False
+
+    def test_column_equals_only_matching_string(self):
+        # A column label should only equal a matching string, never None/ints/floats
+        column = PandasColumn("shares")
+        return (not (column == None)) and (not (column == 0)) and (not (column == 123)) and (column == "shares")

@@ -11,11 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from clr import AddReference
-AddReference("QuantConnect.Algorithm")
-from QuantConnect.Algorithm.Framework.Execution import *
+from AlgorithmImports import *
 
 class NullExecutionModel(ExecutionModel):
     '''Provides an implementation of IExecutionModel that does nothing'''
-    def Execute(self, algorithm, targets):
+    def execute(self, algorithm, targets):
         pass

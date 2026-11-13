@@ -11,11 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from clr import AddReference
-AddReference("QuantConnect.Algorithm")
-from QuantConnect.Algorithm.Framework.Portfolio import *
+from AlgorithmImports import *
 
 class NullPortfolioConstructionModel(PortfolioConstructionModel):
     '''Provides an implementation of IPortfolioConstructionModel that does nothing'''
-    def CreateTargets(self, algorithm, insights):
+    def create_targets(self, algorithm, insights):
         return []

@@ -58,7 +58,7 @@ namespace QuantConnect.Securities.Option
         }
 
         /// <summary>
-        /// Gets the margin currently alloted to the specified holding.
+        /// Gets the margin currently allotted to the specified holding.
         /// </summary>
         /// <param name="parameters">An object containing the security</param>
         /// <returns>The maintenance margin required for the option</returns>
@@ -95,7 +95,7 @@ namespace QuantConnect.Securities.Option
         }
 
         /// <summary>
-        /// Get's the margin requirement for a future option based on the underlying future margin requirement and the position side to trade.
+        /// Gets the margin requirement for a future option based on the underlying future margin requirement and the position side to trade.
         /// FOPs margin requirement is an 'S' curve based on the underlying requirement around it's current price, see https://en.wikipedia.org/wiki/Logistic_function
         /// </summary>
         /// <param name="option">The future option contract to trade</param>
@@ -106,6 +106,13 @@ namespace QuantConnect.Securities.Option
             var maximumValue = underlyingRequirement;
             var curveGrowthRate = -7.8m;
             var underlyingPrice = option.Underlying.Price;
+
+            // If the underlying price is 0, we can't calculate a margin requirement, so return the underlying requirement.
+            // This could be removed after GH issue #6523 is resolved.
+            if (option.Underlying == null || option.Underlying.Price == 0m)
+            {
+                return 0;
+            }
 
             if (positionSide == PositionSide.Short)
             {
@@ -141,7 +148,7 @@ namespace QuantConnect.Securities.Option
 
             // we normalize the curve growth rate by dividing by the underlyings price
             // this way, contracts with different order of magnitude price and strike (like CL & ES) share this logic
-            var denominator = Math.Pow(Math.E, (double) (-curveGrowthRate * (option.StrikePrice - underlyingPrice) / underlyingPrice));
+            var denominator = Math.Pow(Math.E, (double) (-curveGrowthRate * (option.ScaledStrikePrice - underlyingPrice) / underlyingPrice));
 
             if (double.IsInfinity(denominator))
             {
